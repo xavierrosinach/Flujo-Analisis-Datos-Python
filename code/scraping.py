@@ -295,15 +295,7 @@ def full_league_season_scraper(driver, league_info_path: str, match_info_path: s
 # ===========================================================================================================================================
 # FUNCIÓN PRINCIPAL. A PARTIR DEL DRIVER OBTENEMOS TODA LA INFORMACIÓN DE TODAS LAS TEMPORADAS QUE TENEMOS
 # ===========================================================================================================================================
-def main_scraping(data_path: str):
-
-    # Creación de un driver general para todo el código
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-
-    # Servicio con chrome driver
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+def main_scraping(driver, data_path: str):
 
     # Creamos los paths de los CSVs con información
     league_info_path = f'{data_path}/raw/LeagueInfo.csv'

@@ -760,18 +760,25 @@ def main_processing_pandas(data_path):
 
         # Elegimos del dataframe la temporada
         df_to_process = player_summ_no_team_all[player_summ_no_team_all['season'] == sel_season].copy()
+        player_league_dict = (player_info_df_cleaned.set_index("player_slug")["league"].to_dict())
 
         # Procesamos según posición
         gk_percentiles = compute_position_groups(df_to_process, "G", GK_GROUPS)
         df_percentiles = compute_position_groups(df_to_process, "D", DF_GROUPS)
         mf_percentiles = compute_position_groups(df_to_process, "M", MF_GROUPS)
-        fw_percentiles = compute_position_groups(df_to_process, "M", MF_GROUPS)
+        fw_percentiles = compute_position_groups(df_to_process, "F", FW_GROUPS)
 
         # Añadimos la temporada
         gk_percentiles.insert(0, "season", sel_season)
         df_percentiles.insert(0, "season", sel_season)
         mf_percentiles.insert(0, "season", sel_season)
         fw_percentiles.insert(0, "season", sel_season)
+
+        # Añadimos la liga
+        gk_percentiles.insert(1, "league", gk_percentiles["player_slug"].map(player_league_dict))
+        df_percentiles.insert(1, "league", df_percentiles["player_slug"].map(player_league_dict))
+        mf_percentiles.insert(1, "league", mf_percentiles["player_slug"].map(player_league_dict))
+        fw_percentiles.insert(1, "league", fw_percentiles["player_slug"].map(player_league_dict))
 
         # Lo añadimos a las listas
         gk_list.append(gk_percentiles)
