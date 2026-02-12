@@ -493,7 +493,7 @@ def player_stats_cleaner(player_stats_df: pd.DataFrame, league: str, season: str
     return cleaned_league_df.fillna(0), players_season_summary_team.fillna(0), players_season_summary_no_team.fillna(0)
 
 # ===========================================================================================================================================
-# CALCULA PERCENTILES POR POSICIÓN Y GRUPOS
+# FUNCIÓN 8. CALCULA PERCENTILES POR POSICIÓN Y GRUPOS
 # ===========================================================================================================================================
 def compute_position_groups(df: pd.DataFrame, position: str, GROUPS: dict) -> pd.DataFrame:
 
@@ -553,7 +553,7 @@ def compute_position_groups(df: pd.DataFrame, position: str, GROUPS: dict) -> pd
     return res
 
 # ===========================================================================================================================================
-#   FUNCIÓN PRINCIPAL -  A PARTIR DE LOS DATOS QUE TENEMOS, LOS TRANSFORMAMOS
+# FUNCIÓN PRINCIPAL -  A PARTIR DE LOS DATOS QUE TENEMOS, LOS TRANSFORMAMOS
 # ===========================================================================================================================================
 def main_processing_pandas(data_path):
 
@@ -798,8 +798,5 @@ def main_processing_pandas(data_path):
     midfielder_percentiles_df.to_csv(f'{data_path}/clean/MidfielderPercentile.csv', sep=';', index=False)
     forward_percentiles_df.to_csv(f'{data_path}/clean/ForwardPercentile.csv', sep=';', index=False)
 
-# ===========================================================================================================================================
-#   EJECUCIÓN DEL CÓDIGO
-# ===========================================================================================================================================
-if __name__ == "__main__":
-    main_processing_pandas(data_path="G:\\FootballData\\data")
+# if __name__ == "__main__":
+#     main_processing_pandas(data_path="G:\\FootballData\\data")

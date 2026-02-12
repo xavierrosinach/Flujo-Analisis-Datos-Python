@@ -1,72 +1,45 @@
-# =====================================================================================================================================
-# PYSPARK PIPELINE COMPLETO (WINDOWS-FRIENDLY)
-# - Lectura: Spark read.csv (sep=';') o Pandas -> Spark (pero aquí uso Spark para tener tipos y evitar “todo string”)
-# - Cálculo: Spark
-# - Escritura: NO df.write.csv (evita winutils/HADOOP_HOME). Escribimos 1 CSV con el driver usando toLocalIterator (streaming).
-#
-# PUNTOS CLAVE QUE ARREGLA ESTE SCRIPT:
-# 1) Normaliza nombres de columnas (League/Season -> league/season, slug -> player_slug, etc.) para que los filtros no devuelvan vacío.
-# 2) Elimina write_csv_spark_single (es lo que te dispara winutils/HADOOP_HOME en Windows).
-# 3) Fuerza driver/worker a usar el mismo Python (evita PYTHON_VERSION_MISMATCH).
-# 4) Evita Arrow y reduce crashes “Python worker exited unexpectedly”.
-# =====================================================================================================================================
-
+# Librerías generales
 import os
 import csv
 import re
 from typing import Dict, List, Optional, Tuple
 
+# Librerías de tratamiento de datos
 import pandas as pd
 from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark import TaskContext
 
-# =====================================================================================================================================
-# CONFIG
-# =====================================================================================================================================
-
+# Configuración - vamos a usar-lo mucho durante el código, para evitar copiar
 SEP = ";"
 ENCODING = "utf-8"
 
 # =====================================================================================================================================
-# UTIL: normalizar nombres de columnas
+# FUNCIÓN 0 (util). NORMALIZACIÓN DE COLUMNAS 
 # =====================================================================================================================================
 def normalize_columns(df: DataFrame) -> DataFrame:
-    """
-    - Pasa a snake_case simple: lower + reemplaza espacios y puntos por '_'
-    - También unifica League/Season a league/season si existen
-    """
+
     if df is None or len(df.columns) == 0:
         return df
 
+    # Para cada nombre de la columna
     for c in df.columns:
-        new = (
-            c.strip()
-            .replace(" ", "_")
-            .replace(".", "_")
-            .replace("-", "_")
-            .lower()
-        )
+        new = (c.strip().replace(" ", "_").replace(".", "_").replace("-", "_").lower())
         if new != c:
             df = df.withColumnRenamed(c, new)
 
     # Unificaciones típicas
-    rename_map = {
-        "league": "league",
-        "season": "season",
-        "slug": "player_slug",   # si existiera en tablas de jugadores/stats
-    }
+    rename_map = {"league": "league", "season": "season", "slug": "player_slug"}
     for old, new in rename_map.items():
         if old in df.columns and new not in df.columns:
             df = df.withColumnRenamed(old, new)
 
-    # Si vienen como League/Season en origen, tras normalize ya serán league/season.
     return df
 
 
 # =====================================================================================================================================
-# UTIL: casting robusto (solo sobre columnas conocidas) para evitar “todo string”
+# FUNCIÓN 0 (util). CASTING DE COLUMNAS NUMÉRICAS PARA EVITAR STRINGS
 # =====================================================================================================================================
 def cast_numeric_cols(df: DataFrame, cols: List[str], as_int: bool = False) -> DataFrame:
     if df is None or len(df.columns) == 0:
@@ -79,13 +52,10 @@ def cast_numeric_cols(df: DataFrame, cols: List[str], as_int: bool = False) -> D
         s = F.col(c).cast("string")
         s = F.regexp_replace(s, ",", ".")
         s = F.regexp_replace(s, r"[^\d\.\-]", "")
-
-        # try_cast sin SQL: casteo tolerante usando regexp + cast con when
-        # (si queda vacío -> null)
         s = F.when((s.isNull()) | (s == ""), F.lit(None)).otherwise(s)
 
+        # Si tiene que ser integer lo devolvemos
         if as_int:
-            # "1.0" -> double -> int
             df = df.withColumn(c, s.cast("double").cast("int"))
         else:
             df = df.withColumn(c, s.cast("double"))
@@ -93,34 +63,23 @@ def cast_numeric_cols(df: DataFrame, cols: List[str], as_int: bool = False) -> D
     return df
 
 # =====================================================================================================================================
-# FUNCIÓN 1. DIVISIÓN SEGURA (EVITA DIV / 0 Y NULOS)
+# FUNCIÓN 1. DIVISIÓN SEGURA ENTRE DOS NUMEROS
 # =====================================================================================================================================
 def safe_div(n_col, d_col):
-    """Devuelve n/d si d != 0 y ambos no son nulos; en caso contrario devuelve null."""
-    return F.when(
-        (d_col.isNotNull()) & (d_col != F.lit(0)) & (n_col.isNotNull()),
-        n_col.cast("double") / d_col.cast("double"),
-    ).otherwise(F.lit(None).cast("double"))
+
+    # División segura en caso de que el dividendo sea 0
+    return F.when((d_col.isNotNull()) & (d_col != F.lit(0)) & (n_col.isNotNull()), n_col.cast("double") / d_col.cast("double")).otherwise(F.lit(None).cast("double"))
 
 # =====================================================================================================================================
-# FUNCIÓN 2. FILTRADO POR LIGA/TEMPORADA Y OPCIONALMENTE EQUIPO/JUGADOR (CON SLUG)
+# FUNCIÓN 2. FILTRADO POR LIGA/TEMPORADA Y OPCIONALMENTE EQUIPO/JUGADOR
 # =====================================================================================================================================
-def filter_df(
-    df: DataFrame,
-    league: str,
-    season: str,
-    team: Optional[str] = None,
-    player: Optional[str] = None
-) -> DataFrame:
-    """
-    Filtra siempre por (league, season). Si se indica team o player, filtra por team_slug/player_slug.
-    OJO: requiere columnas ya normalizadas a 'league' y 'season'.
-    """
+def filter_df(df: DataFrame,league: str,season: str,team: Optional[str] = None,player: Optional[str] = None) -> DataFrame:
+
     if df is None or len(df.columns) == 0:
         return df
 
+    # Filtra siempre por liga y por temporada
     if "league" not in df.columns or "season" not in df.columns:
-        # Si no existen, devolvemos vacío con mismo schema
         return df.limit(0)
 
     out = df.filter((F.col("league") == league) & (F.col("season") == season))
@@ -141,9 +100,8 @@ def filter_df(
 
     return out
 
-
 # =====================================================================================================================================
-# FUNCIÓN 3. LIMPIEZA DEL DATAFRAME DE INFORMACIÓN DE JUGADORES (PLAYERINFO)
+# FUNCIÓN 3. LIMPIEZA DEL DATAFRAME DE INFORMACIÓN DE JUGADORES
 # =====================================================================================================================================
 def player_info_cleaner(player_info_df: DataFrame) -> DataFrame:
     df = player_info_df
@@ -154,49 +112,33 @@ def player_info_cleaner(player_info_df: DataFrame) -> DataFrame:
     df = cast_numeric_cols(df, ["jersey_number"], as_int=True)
     df = cast_numeric_cols(df, ["market_value"], as_int=False)
 
-    # jersey_number null -> 0
     if "jersey_number" in df.columns:
         df = df.withColumn("jersey_number", F.coalesce(F.col("jersey_number"), F.lit(0)).cast("int"))
 
-    # market_value null -> 0
     if "market_value" in df.columns:
         df = df.withColumn("market_value", F.coalesce(F.col("market_value"), F.lit(0.0)).cast("double"))
 
-    # date_birth: epoch (s o ms) → dd/MM/yyyy + age
+    # Fecha de nacimiento a edad valida y fecha valida
     if "date_birth" in df.columns:
         s = F.col("date_birth").cast("double")
 
-        secs = (
-            F.when(s.isNull(), F.lit(None).cast("double"))
-            .when(s > F.lit(1e12), s / F.lit(1000.0))
-            .otherwise(s)
-        )
+        secs = (F.when(s.isNull(), F.lit(None).cast("double")).when(s > F.lit(1e12), s / F.lit(1000.0)).otherwise(s))
 
         birth_ts = F.to_timestamp(F.from_unixtime(secs))
         birth_date = F.to_date(birth_ts)
         today = F.current_date()
 
-        age = (
-            F.year(today) - F.year(birth_date)
-            - F.when(
-                (F.month(today) < F.month(birth_date)) |
-                ((F.month(today) == F.month(birth_date)) & (F.dayofmonth(today) < F.dayofmonth(birth_date))),
-                F.lit(1)
-            ).otherwise(F.lit(0))
-        )
+        age = (F.year(today) - F.year(birth_date) - F.when((F.month(today) < F.month(birth_date)) |
+                ((F.month(today) == F.month(birth_date)) & (F.dayofmonth(today) < F.dayofmonth(birth_date))), F.lit(1)
+            ).otherwise(F.lit(0)))
 
-        df = (
-            df.withColumn("birth_ts", birth_ts)
-              .withColumn("age", F.coalesce(age, F.lit(0)).cast("int"))
-              .withColumn("date_birth", F.date_format(F.col("birth_ts"), "dd/MM/yyyy"))
-              .drop("birth_ts")
-        )
+        df = (df.withColumn("birth_ts", birth_ts).withColumn("age", F.coalesce(age, F.lit(0)).cast("int"))
+              .withColumn("date_birth", F.date_format(F.col("birth_ts"), "dd/MM/yyyy")).drop("birth_ts"))
 
     return df
 
-
 # =====================================================================================================================================
-# FUNCIÓN 4. LIMPIEZA DEL DATAFRAME DE INFORMACIÓN DE PARTIDOS (MATCHINFO)
+# FUNCIÓN 4. LIMPIEZA DEL DATAFRAME DE INFORMACIÓN DE PARTIDOS
 # =====================================================================================================================================
 def match_info_cleaner(match_info_df: DataFrame) -> DataFrame:
     df = match_info_df
@@ -210,38 +152,27 @@ def match_info_cleaner(match_info_df: DataFrame) -> DataFrame:
         if colname in df.columns:
             df = df.withColumn(colname, F.coalesce(F.col(colname), F.lit(0)).cast("int"))
 
-    # date: epoch (s o ms) → dd/MM/yyyy + time (HH:mm)
+    # Fecha correcta
     if "date" in df.columns:
         df = cast_numeric_cols(df, ["date"], as_int=False)
         s = F.col("date").cast("double")
 
-        secs = (
-            F.when(s.isNull(), F.lit(None).cast("double"))
-            .when(s > F.lit(1e12), s / F.lit(1000.0))
-            .otherwise(s)
-        )
+        secs = (F.when(s.isNull(), F.lit(None).cast("double")).when(s > F.lit(1e12), s / F.lit(1000.0)).otherwise(s))
 
         dt_ts = F.to_timestamp(F.from_unixtime(secs))
 
-        df = (
-            df.withColumn("date_ts", dt_ts)
-              .withColumn("date", F.date_format(F.col("date_ts"), "dd/MM/yyyy"))
-              .withColumn("time", F.date_format(F.col("date_ts"), "HH:mm"))
-              .drop("date_ts")
-        )
+        df = (df.withColumn("date_ts", dt_ts).withColumn("date", F.date_format(F.col("date_ts"), "dd/MM/yyyy"))
+              .withColumn("time", F.date_format(F.col("date_ts"), "HH:mm")).drop("date_ts"))
 
     return df
 
-
 # =====================================================================================================================================
-# FUNCIÓN 5. AÑADIR FEATURES POR PARTIDO (MATCH-LEVEL) A PLAYERSTATS
+# FUNCIÓN 5. AÑADIR FEATURES POR PARTIDO
 # =====================================================================================================================================
 def add_match_features(df: DataFrame) -> DataFrame:
     out = df
 
-    # -----------------------------
-    # Básicos: flags + p90_factor
-    # -----------------------------
+    # Flags básicos
     if "minutesplayed" in out.columns:  # tras normalize_columns => minutesplayed
         out = out.withColumn("minutesplayed", F.coalesce(F.col("minutesplayed").cast("double"), F.lit(0.0)))
         out = out.withColumn("played", F.col("minutesplayed") > 0)
@@ -253,10 +184,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
         else:
             out = out.withColumn("start", F.lit(False)).withColumn("sub_appearance", F.lit(False))
 
-        out = out.withColumn(
-            "p90_factor",
-            F.when(F.col("minutesplayed") > 0, F.lit(90.0) / F.col("minutesplayed")).otherwise(F.lit(None).cast("double")),
-        )
+        out = out.withColumn("p90_factor", F.when(F.col("minutesplayed") > 0, F.lit(90.0) / F.col("minutesplayed")).otherwise(F.lit(None).cast("double")),)
     else:
         out = out.withColumn("minutesplayed", F.lit(0.0)).withColumn("played", F.lit(False)).withColumn("p90_factor", F.lit(None).cast("double"))
 
@@ -265,7 +193,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             return df0.withColumn(outname, safe_div(F.col(num), F.col(den)))
         return df0
 
-    # PASSING
+    # Pase
     out = add_ratio(out, "accuratepass", "totalpass", "pass_accuracy")
     out = add_ratio(out, "accuratelongballs", "totallongballs", "longball_accuracy")
     out = add_ratio(out, "totallongballs", "totalpass", "longballs_share_of_passes")
@@ -278,17 +206,12 @@ def add_match_features(df: DataFrame) -> DataFrame:
     out = add_ratio(out, "bigchancecreated", "keypass", "bigchance_created_per_keypass")
 
     if "p90_factor" in out.columns:
-        for c in [
-            "totalpass","accuratepass",
-            "totallongballs","accuratelongballs",
-            "totalcross","accuratecross",
-            "keypass","bigchancecreated",
-            "totalthroughballs","accuratethroughballs",
-        ]:
+        for c in ["totalpass","accuratepass","totallongballs","accuratelongballs","totalcross","accuratecross",
+                  "keypass","bigchancecreated","totalthroughballs","accuratethroughballs"]:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # SHOOTING
+    # Tiro
     out = add_ratio(out, "shotsontarget", "totalshot", "shot_accuracy_on_target")
     out = add_ratio(out, "goals", "totalshot", "goal_conversion_per_shot")
     out = add_ratio(out, "goals", "shotsontarget", "goal_conversion_per_sot")
@@ -312,7 +235,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # DRIBBLES
+    # Dribblings
     out = add_ratio(out, "successfuldribbles", "totaldribble", "dribble_success_rate")
     out = add_ratio(out, "successfuldribbles", "totalpass", "dribbles_per_pass")
     out = add_ratio(out, "woncontest", "totalcontest", "contest_win_rate")
@@ -322,7 +245,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # DUELOS
+    # Duelos
     out = add_ratio(out, "duelwon", "totalduels", "duel_win_rate")
     out = add_ratio(out, "groundduelswon", "groundduels", "ground_duel_win_rate")
     out = add_ratio(out, "aerialduelswon", "aerialduels", "aerial_duel_win_rate")
@@ -333,7 +256,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # DEFENSA
+    # Defensa
     out = add_ratio(out, "tackleswon", "tackles", "tackle_success_rate")
     if ("challengewon" in out.columns) and ("challengelost" in out.columns):
         out = out.withColumn("challenge_total", F.col("challengewon").cast("double") + F.col("challengelost").cast("double"))
@@ -350,7 +273,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
         if "def_actions" in out.columns:
             out = out.withColumn("def_actions_per90", F.col("def_actions").cast("double") * F.col("p90_factor"))
 
-    # POSESIÓN
+    # Posesión
     out = add_ratio(out, "possessionlost", "touches", "possession_lost_per_touch")
     out = add_ratio(out, "dispossessed", "touches", "dispossessed_per_touch")
     out = add_ratio(out, "ballrecovery", "possessionlost", "recovery_to_loss_ratio")
@@ -360,7 +283,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # DISCIPLINA
+    # Disciplina (tarjetas)
     if ("yellowcards" in out.columns) and ("redcards" in out.columns):
         out = out.withColumn("cards", F.col("yellowcards").cast("double") + F.lit(2.0) * F.col("redcards").cast("double"))
     if "p90_factor" in out.columns:
@@ -368,7 +291,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # GOALKEEPER
+    # Estadisticas del portero
     out = add_ratio(out, "saves", "shotsontargetfaced", "gk_save_pct")
     out = add_ratio(out, "goalsconceded", "shotsontargetfaced", "gk_concede_per_sot")
     if ("goalsconceded" in out.columns) and ("postshotexpectedgoals" in out.columns):
@@ -379,7 +302,7 @@ def add_match_features(df: DataFrame) -> DataFrame:
             if c in out.columns:
                 out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90_factor"))
 
-    # COMPUESTAS
+    # Varias
     if ("expectedgoals" in out.columns) and ("expectedassists" in out.columns):
         out = out.withColumn("attack_value_raw", F.col("expectedgoals").cast("double") + F.col("expectedassists").cast("double"))
         if "keypass" in out.columns:
@@ -399,16 +322,15 @@ def add_match_features(df: DataFrame) -> DataFrame:
 
     return out
 
-
 # =====================================================================================================================================
-# FUNCIÓN 6. RESUMEN DE TEMPORADA POR JUGADOR (CON Y SIN EQUIPO) DESDE MATCH-LEVEL
+# FUNCIÓN 6. RESUMEN DE TEMPORADA POR JUGADOR (CON Y SIN EQUIPO)
 # =====================================================================================================================================
 def players_season_summary(df_match_player: DataFrame, by_team: bool = True) -> DataFrame:
     df = df_match_player
     if df is None or len(df.columns) == 0:
         return df
 
-    # Flags mínimos
+    # Flags
     if "minutesplayed" in df.columns:
         df = df.withColumn("minutesplayed", F.coalesce(F.col("minutesplayed").cast("double"), F.lit(0.0)))
         df = df.withColumn("played", F.col("minutesplayed") > 0)
@@ -427,17 +349,12 @@ def players_season_summary(df_match_player: DataFrame, by_team: bool = True) -> 
 
     match_id_col = "match" if "match" in df.columns else ("match_slug" if "match_slug" in df.columns else None)
 
-    agg_exprs = [
-        (F.countDistinct(F.col(match_id_col)).alias("matches") if match_id_col else F.lit(0).cast("long").alias("matches")),
-        F.sum(F.col("played").cast("int")).alias("matchesplayed"),
-        F.sum(F.col("start").cast("int")).alias("starts"),
-        F.sum(F.col("minutesplayed")).alias("minutes"),
-    ]
+    agg_exprs = [(F.countDistinct(F.col(match_id_col)).alias("matches") if match_id_col else F.lit(0).cast("long").alias("matches")),
+                  F.sum(F.col("played").cast("int")).alias("matchesplayed"), F.sum(F.col("start").cast("int")).alias("starts"),
+                  F.sum(F.col("minutesplayed")).alias("minutes")]
 
-    numeric_cols = [
-        f.name for f in df.schema.fields
-        if isinstance(f.dataType, (T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.ShortType, T.DecimalType))
-    ]
+    numeric_cols = [f.name for f in df.schema.fields
+                    if isinstance(f.dataType, (T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.ShortType, T.DecimalType))]
     exclude = {"minutesplayed", "match", "player_id", "team_id", "season_id", "league_id"}
     sum_cols = [c for c in numeric_cols if c not in exclude]
 
@@ -451,7 +368,7 @@ def players_season_summary(df_match_player: DataFrame, by_team: bool = True) -> 
             return df0.withColumn(outname, safe_div(F.col(num), F.col(den)))
         return df0
 
-    # Ratios recalculados (ojo: nombres normalizados a lower)
+    # Ratios recalculados otra vez
     out = add_ratio_df(out, "accuratepass", "totalpass", "passaccuracy")
     out = add_ratio_df(out, "accuratelongballs", "totallongballs", "longballaccuracy")
     out = add_ratio_df(out, "accuratecross", "totalcross", "crossaccuracy")
@@ -471,12 +388,10 @@ def players_season_summary(df_match_player: DataFrame, by_team: bool = True) -> 
     # Por 90
     out = out.withColumn("p90factor", F.when(F.col("minutes") > 0, F.lit(90.0) / F.col("minutes")).otherwise(F.lit(None).cast("double")))
 
-    per90_candidates = [
-        "goals","goalassist","expectedgoals","expectedassists","totalshot","shotsontarget","keypass","bigchancecreated",
-        "totalpass","accuratepass","totallongballs","accuratelongballs","successfuldribbles","totaldribble","duelwon",
-        "totalduels","tackleswon","tackles","interceptionwon","ballrecovery","clearance","blockedshots","possessionlost",
-        "touches","yellowcards","redcards"
-    ]
+    per90_candidates = ["goals","goalassist","expectedgoals","expectedassists","totalshot","shotsontarget","keypass","bigchancecreated",
+                        "totalpass","accuratepass","totallongballs","accuratelongballs","successfuldribbles","totaldribble","duelwon",
+                        "totalduels","tackleswon","tackles","interceptionwon","ballrecovery","clearance","blockedshots","possessionlost",
+                        "touches","yellowcards","redcards"]
     for c in per90_candidates:
         if c in out.columns:
             out = out.withColumn(f"{c}_per90", F.col(c).cast("double") * F.col("p90factor"))
@@ -499,9 +414,8 @@ def players_season_summary(df_match_player: DataFrame, by_team: bool = True) -> 
     out = out.drop("p90factor")
     return out
 
-
 # =====================================================================================================================================
-# FUNCIÓN 7. LIMPIEZA DE PLAYERSTATS PARA UNA LIGA/TEMPORADA + FEATURES + RESÚMENES
+# FUNCIÓN 7. LIMPIEZA DE PLAYERSTATS PARA UNA LIGA/TEMPORADA Y CREACIÓ DE RESUMENES Y FEATURES
 # =====================================================================================================================================
 def player_stats_cleaner(player_stats_df: DataFrame, league: str, season: str) -> Tuple[DataFrame, DataFrame, DataFrame]:
     league_df = filter_df(player_stats_df, league=league, season=season)
@@ -510,14 +424,11 @@ def player_stats_cleaner(player_stats_df: DataFrame, league: str, season: str) -
         empty = league_df
         return empty, empty, empty
 
-    # columnas numéricas reales (tras lectura con inferSchema deberían ser numéricas)
-    numeric_cols = [
-        f.name for f in league_df.schema.fields
-        if isinstance(f.dataType, (T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.ShortType, T.DecimalType))
-        and ("match" not in f.name.lower())
-    ]
+    # Numericas
+    numeric_cols = [f.name for f in league_df.schema.fields 
+                    if isinstance(f.dataType, (T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.ShortType, T.DecimalType)) and ("match" not in f.name.lower())]
 
-    # Máscara fila > 0 (null->0)
+    # MAsccara de fila mayor a 0
     if numeric_cols:
         row_sum = sum(F.coalesce(F.col(c).cast("double"), F.lit(0.0)) for c in numeric_cols)
         league_df = league_df.withColumn("_row_sum", row_sum).filter(F.col("_row_sum") > 0).drop("_row_sum")
@@ -538,17 +449,10 @@ def player_stats_cleaner(player_stats_df: DataFrame, league: str, season: str) -
 
     return cleaned_league_df, players_season_summary_team, players_season_summary_no_team
 
-
 # =====================================================================================================================================
-# FUNCIÓN 8. PERCENTIL “GLOBAL” POR GRUPO DE MÉTRICAS (SPARK)
+# FUNCIÓN 8. CREACIÓN DEL PERCENTIL GROBAL POR GRUPOS DE MÉTRICAS
 # =====================================================================================================================================
-def overall_percentile_spark(
-    df: DataFrame,
-    metric_cols: List[str],
-    invert_cols: List[str],
-    player_col: str = "player_slug",
-    out_col: str = "pct_group"
-) -> DataFrame:
+def overall_percentile_spark(df: DataFrame, metric_cols: List[str],invert_cols: List[str],player_col: str = "player_slug",out_col: str = "pct_group") -> DataFrame:
     existing = [c for c in metric_cols if c in df.columns]
     if not existing:
         return df.select(F.col(player_col)).dropDuplicates([player_col]).withColumn(out_col, F.lit(None).cast("double"))
@@ -570,7 +474,7 @@ def overall_percentile_spark(
             )
         pct_cols.append(pct_name)
 
-    # media ignorando nulls
+    # Media del valor sin tener en cuenta los nulos
     sum_expr = None
     cnt_expr = None
     for pc in pct_cols:
@@ -582,24 +486,17 @@ def overall_percentile_spark(
     out = out.withColumn(out_col, F.when(cnt_expr > 0, sum_expr / cnt_expr.cast("double")).otherwise(F.lit(None).cast("double")))
     return out.select(F.col(player_col), F.col(out_col))
 
-
 # =====================================================================================================================================
-# FUNCIÓN 9. PERCENTILES POR POSICIÓN Y POR GRUPO (SPARK)
+# FUNCIÓN 9. PERCENTILES POR POSICIÓN Y POR GRUPO
 # =====================================================================================================================================
 def compute_position_groups_spark(df: DataFrame, position: str, GROUPS: Dict) -> DataFrame:
     pos_df = df.filter(F.col("position") == position)
     outputs = []
 
+    # Para cada grupo, obtenemos las métricas
     for group_name, cfg in GROUPS.items():
-        outputs.append(
-            overall_percentile_spark(
-                pos_df,
-                metric_cols=cfg.get("cols", []),
-                invert_cols=cfg.get("invert", []),
-                player_col="player_slug",
-                out_col=f"pct_{group_name.lower()}",
-            )
-        )
+        outputs.append(overall_percentile_spark(pos_df, metric_cols=cfg.get("cols", []),invert_cols=cfg.get("invert", []),
+                                                player_col="player_slug",out_col=f"pct_{group_name.lower()}"))
 
     if not outputs:
         return pos_df.select("player_slug").dropDuplicates(["player_slug"])
@@ -610,37 +507,20 @@ def compute_position_groups_spark(df: DataFrame, position: str, GROUPS: Dict) ->
 
     return res
 
+# =====================================================================================================================================
+# FUNCIONES DE LECTURA Y ESCRITURA DE DATOS. LECTURA DEL CSV Y ESCRITURA (distintas funciones)
+# =====================================================================================================================================
+def read_csv_spark(spark: SparkSession,path: str,sep: str = ";",encoding: str = "utf-8",) -> DataFrame:
 
-# =====================================================================================================================================
-# I/O: Lectura CSV (Spark) y Escritura CSV ÚNICO sin winutils
-# =====================================================================================================================================
-def read_csv_spark(
-    spark: SparkSession,
-    path: str,
-    sep: str = ";",
-    encoding: str = "utf-8",
-) -> DataFrame:
-    """
-    Lectura con Spark (local). No necesita winutils.
-    """
     if not os.path.exists(path):
         return spark.createDataFrame([], schema=T.StructType([]))
 
-    df = (
-        spark.read
-        .option("header", True)
-        .option("sep", sep)
-        .option("encoding", encoding)
-        .option("inferSchema", True)
-        .csv(path)
-    )
+    df = (spark.read.option("header", True).option("sep", sep).option("encoding", encoding).option("inferSchema", True).csv(path))
     return df
 
+# Escribe CSV sin tener en cuenta Hadoop (daba errores)
 def write_csv_single_no_hadoop(df: DataFrame, path: str, sep: str = ";", encoding: str = "utf-8") -> None:
-    """
-    Escribe 1 CSV (un solo fichero) sin usar df.write.csv (evita HADOOP_HOME/winutils).
-    Streaming desde driver: toLocalIterator() + csv.writer.
-    """
+    
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -655,6 +535,7 @@ def write_csv_single_no_hadoop(df: DataFrame, path: str, sep: str = ";", encodin
         for row in df.select(*cols).toLocalIterator():
             w.writerow([row[c] for c in cols])
 
+# Particiona con Hadoop
 def write_csv_partitioned_no_hadoop(df, out_dir, sep=";", encoding="utf-8", max_parts=64):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -672,20 +553,13 @@ def write_csv_partitioned_no_hadoop(df, out_dir, sep=";", encoding="utf-8", max_
                 for row in it:
                     w.writerow([row[c] for c in cols])
         except Exception as e:
-            # Esto hace que Spark te muestre el error REAL (no solo "worker crashed")
-            raise RuntimeError(f"Error escribiendo {path}: {repr(e)}") from e
+            raise RuntimeError(f"{path}: {repr(e)}") from e
 
     df2.select(*cols).rdd.foreachPartition(write_part)
 
+# Crea distintas partes y las mezcla - evitar carga
+def merge_parts_to_single(parts_dir: str,final_path: str,encoding: str = "utf-8",) -> None:
 
-def merge_parts_to_single(
-    parts_dir: str,
-    final_path: str,
-    encoding: str = "utf-8",
-) -> None:
-    """
-    Une part-*.csv en un único CSV, saltando headers repetidos.
-    """
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     part_files = sorted(
         f for f in os.listdir(parts_dir)
@@ -698,114 +572,79 @@ def merge_parts_to_single(
             with open(os.path.join(parts_dir, pf), "r", encoding=encoding) as fin:
                 for i, line in enumerate(fin):
                     if not first and i == 0:
-                        continue  # saltar header
+                        continue
                     fout.write(line)
             first = False
 
-
 # =====================================================================================================================================
-# MAIN
+# FUNCIÓN PRINCIPAL - PROCESADO DE LOS DATOS INICIALES SCRAPEADOS
 # =====================================================================================================================================
 def main_processing_spark(data_path: str) -> None:
 
     # Entorno de spark
-    spark = (
-        SparkSession.builder
-        .appName("processing")
-        .config("spark.driver.memory", "8g")
-        .config("spark.executor.memory", "8g")
-        .config("spark.memory.fraction", "0.6")
-        .config("spark.sql.shuffle.partitions", "64")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.execution.arrow.pyspark.enabled", "false")
-        .config("spark.python.worker.faulthandler.enabled", "true")
-        .config("spark.sql.execution.pyspark.udf.faulthandler.enabled", "true")
-        .getOrCreate()
-    )
-
+    spark = (SparkSession.builder.appName("processing").config("spark.driver.memory", "8g").config("spark.executor.memory", "8g")
+             .config("spark.memory.fraction", "0.6").config("spark.sql.shuffle.partitions", "64").config("spark.sql.adaptive.enabled", "true")
+             .config("spark.sql.execution.arrow.pyspark.enabled", "false").config("spark.python.worker.faulthandler.enabled", "true")
+             .config("spark.sql.execution.pyspark.udf.faulthandler.enabled", "true").getOrCreate())
     spark.sparkContext.setLogLevel("ERROR")
 
 
-    # ==============================================================================================================================
-    # GRUPOS PARA PERCENTILES (NO LOS TOCO, SOLO NORMALIZO NOMBRES DE SALIDA A lower)
-    # ==============================================================================================================================
+    # Grupos de porcentiles por posición
     GK_GROUPS = {
         "ShotStopping": {"cols": ["GoalsMinusxG", "goalsPrevented", "saves_per90"], "invert": []},
         "Reliability": {"cols": ["errorLeadToAGoal", "errorLeadToAShot", "ownGoals"], "invert": ["errorLeadToAGoal", "errorLeadToAShot", "ownGoals"]},
         "AreaControl": {"cols": ["goodHighClaim", "punches", "crossNotClaimed"], "invert": ["crossNotClaimed"]},
         "SweeperKeeper": {"cols": ["totalKeeperSweeper", "accurateKeeperSweeper"], "invert": []},
-        "BuildUpPlay": {"cols": ["pass_accuracy", "longball_accuracy"], "invert": []},
-    }
+        "BuildUpPlay": {"cols": ["pass_accuracy", "longball_accuracy"], "invert": []}}
 
     DF_GROUPS = {
         "DefensiveActions": {"cols": ["DefActions_per90", "interceptionWon_per90", "ballRecovery_per90"], "invert": []},
         "Duels": {"cols": ["duelWon_per90", "contest_win_rate"], "invert": []},
         "AerialAbility": {"cols": ["aerialWon", "aerialLost"], "invert": ["aerialLost"]},
         "BuildUpPlay": {"cols": ["pass_accuracy", "totalProgression", "progressiveBallCarriesCount"], "invert": []},
-        "DefensiveReliability": {"cols": ["errorLeadToAGoal", "penaltyConceded", "fouls_per90"], "invert": ["errorLeadToAGoal", "penaltyConceded", "fouls_per90"]},
-    }
+        "DefensiveReliability": {"cols": ["errorLeadToAGoal", "penaltyConceded", "fouls_per90"], "invert": ["errorLeadToAGoal", "penaltyConceded", "fouls_per90"]}}
 
     MF_GROUPS = {
         "BallDistribution": {"cols": ["pass_accuracy", "totalPass_per90", "passValueNormalized"], "invert": []},
         "Progression": {"cols": ["totalProgression", "progressiveBallCarriesCount", "bestBallCarryProgression"], "invert": []},
         "ChanceCreation": {"cols": ["keyPass_per90", "expectedAssists_per90", "bigChanceCreated_per90"], "invert": []},
         "DefensiveBalance": {"cols": ["DefActions_per90", "ballRecovery_per90"], "invert": []},
-        "BallRetention": {"cols": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch"], "invert": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch"]},
-    }
+        "BallRetention": {"cols": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch"], "invert": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch"]}}
 
     FW_GROUPS = {
         "Finishing": {"cols": ["goals_per90", "expectedGoals_per90", "goals_over_xg", "shotValueNormalized", "bigChanceMissed_per90"], "invert": ["bigChanceMissed_per90"]},
         "ChanceCreation": {"cols": ["keyPass_per90", "expectedAssists_per90", "bigChanceCreated_per90", "assists_over_xa", "goalAssist_per90"], "invert": []},
         "Threat": {"cols": ["dribbleValueNormalized", "totalProgression", "progressiveBallCarriesCount", "attack_value_raw_per90", "totalShots"], "invert": []},
         "OffBallInvolvement": {"cols": ["touches_per90", "wasFouled_per90", "penaltyWon", "totalOffside", "ballCarriesCount"], "invert": []},
-        "Efficiency": {"cols": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch", "fouls_per90", "bigChanceMissed_per90"], "invert": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch", "fouls_per90", "bigChanceMissed_per90"]},
-    }
+        "Efficiency": {"cols": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch", "fouls_per90", "bigChanceMissed_per90"], "invert": ["dispossessed_per90", "possessionLostCtrl", "unsuccessfulTouch", "fouls_per90", "bigChanceMissed_per90"]}}
 
-    # ==============================================================================================================================
-    # LECTURA RAW
-    # ==============================================================================================================================
+    # Lectura de los dataframes de scraping anteriores
     league_info_df = read_csv_spark(spark, f"{data_path}/raw/LeagueInfo.csv", sep=SEP)
     match_info_df  = read_csv_spark(spark, f"{data_path}/raw/MatchInfo.csv",  sep=SEP)
     player_info_df = read_csv_spark(spark, f"{data_path}/raw/PlayerInfo.csv", sep=SEP)
     player_stats_df= read_csv_spark(spark, f"{data_path}/raw/PlayerStats.csv",sep=SEP)
 
-    # Normaliza columnas para que TODO use league/season/player_slug...
+    # Normalización de las columnas con la función creada
     league_info_df  = normalize_columns(league_info_df)
     match_info_df   = normalize_columns(match_info_df)
     player_info_df  = normalize_columns(player_info_df)
     player_stats_df = normalize_columns(player_stats_df)
 
-    # Si en alguna tabla el slug era "slug", ya lo convertimos en normalize_columns.
-    # Si venía como "player_slug" ya estaba ok.
-
-    print("DF leídos")
-
-    # ==============================================================================================================================
-    # CLEANING BÁSICO
-    # ==============================================================================================================================
+    # Cleaning de los dataframes básicos
     match_info_df_cleaned  = match_info_cleaner(match_info_df)
     player_info_df_cleaned = player_info_cleaner(player_info_df)
 
-    # Escritura CLEAN sin Hadoop/winutils
+    # Guardado
     write_csv_single_no_hadoop(match_info_df_cleaned,  f"{data_path}/clean/MatchInfo.csv", sep=SEP)
     write_csv_single_no_hadoop(player_info_df_cleaned, f"{data_path}/clean/PlayerInfo.csv", sep=SEP)
 
-    print("Cleaning basic OK")
-
     # Diccionario player_slug -> name
-    player_name_df = (
-        player_info_df_cleaned
-        .select("player_slug", "name")
-        .dropna()
-        .dropDuplicates(["player_slug"])
-    )
+    player_name_df = (player_info_df_cleaned.select("player_slug", "name").dropna().dropDuplicates(["player_slug"]))
 
-    # ==============================================================================================================================
-    # PROCESO POR (league, season)
-    # ==============================================================================================================================
-    # OJO: LeagueInfo normalizado => league/season
+    # Procesamos por cada liga y cada temporada
     league_rows = league_info_df.select("league", "season").dropna().dropDuplicates().collect()
 
+    # Listas de dataframes vacías que vamos a ir procesando
     cleaned_league_list: List[DataFrame] = []
     summ_team_list: List[DataFrame] = []
     summ_no_team_list: List[DataFrame] = []
@@ -816,12 +655,8 @@ def main_processing_spark(data_path: str) -> None:
 
         cleaned_league_df, summ_team_df, summ_no_team_df = player_stats_cleaner(player_stats_df, sel_league, sel_season)
 
-        players_season_pos = (
-            player_info_df_cleaned
-            .filter((F.col("league") == sel_league) & (F.col("season") == sel_season))
-            .select("player_slug", "position")
-            .dropDuplicates(["player_slug"])
-        )
+        players_season_pos = (player_info_df_cleaned.filter((F.col("league") == sel_league) & (F.col("season") == sel_season))
+                              .select("player_slug", "position").dropDuplicates(["player_slug"]))
 
         summ_team_df = summ_team_df.join(players_season_pos, on="player_slug", how="left")
         summ_no_team_df = summ_no_team_df.join(players_season_pos, on="player_slug", how="left")
@@ -838,26 +673,21 @@ def main_processing_spark(data_path: str) -> None:
             out = out.unionByName(d, allowMissingColumns=True)
         return out
 
+    # Unimos usando la función interna creada
     cleaned_league_all = union_all(cleaned_league_list).dropDuplicates(["league","season","player_slug","match"])
     player_summ_no_team_all = union_all(summ_no_team_list).dropDuplicates(["league","season","player_slug"])
     player_summ_team_all = union_all(summ_team_list).dropDuplicates(["league","season","player_slug","team_slug"])
 
-    # Añadimos player_name
+    # Añadimos nombre del jugador con el diccionario creado
     cleaned_league_all = cleaned_league_all.join(player_name_df, on="player_slug", how="left").withColumnRenamed("name", "player_name")
     player_summ_team_all = player_summ_team_all.join(player_name_df, on="player_slug", how="left").withColumnRenamed("name", "player_name")
     player_summ_no_team_all = player_summ_no_team_all.join(player_name_df, on="player_slug", how="left").withColumnRenamed("name", "player_name")
 
-    # Guardados “clean”
-    # Guardados “clean” (SIN driver OOM)
+    # Creación de la carpeta con distintas partes
     tmp_dir = f"{data_path}/clean/_tmp_parts"
 
-    # Prueva
-    print("prova")
-    test_df = cleaned_league_all.limit(10000)
-    write_csv_partitioned_no_hadoop(test_df, out_dir=f"{tmp_dir}/_test_PlayerStats", sep=SEP, encoding=ENCODING, max_parts=4)
-    print("prova")
-
-    write_csv_partitioned_no_hadoop(cleaned_league_all, out_dir=f"{tmp_dir}/PlayerStats", sep=SEP, encoding=ENCODING, max_parts=128)
+    # Guardamos por partes y posteriormente juntamos
+    write_csv_partitioned_no_hadoop(cleaned_league_all, out_dir=f"{tmp_dir}/PlayerStats", sep=SEP, encoding=ENCODING, max_parts=32)
     merge_parts_to_single(parts_dir=f"{tmp_dir}/PlayerStats", final_path=f"{data_path}/clean/PlayerStats.csv", encoding=ENCODING)
 
     write_csv_partitioned_no_hadoop(player_summ_team_all, out_dir=f"{tmp_dir}/PlayerTeamStatsSummary", sep=SEP, encoding=ENCODING, max_parts=32)
@@ -866,11 +696,7 @@ def main_processing_spark(data_path: str) -> None:
     write_csv_partitioned_no_hadoop(player_summ_no_team_all,out_dir=f"{tmp_dir}/PlayerStatsSummary", sep=SEP, encoding=ENCODING, max_parts=32)
     merge_parts_to_single(parts_dir=f"{tmp_dir}/PlayerStatsSummary", final_path=f"{data_path}/clean/PlayerStatsSummary.csv",encoding=ENCODING)
     
-    print("Processing avanzado OK")
-
-    # ==============================================================================================================================
-    # PERCENTILES POR TEMPORADA (SOBRE SUMMARY SIN EQUIPO)
-    # ==============================================================================================================================
+    # Creación de porcentiles por temporada
     seasons = [r["season"] for r in league_info_df.select("season").dropna().dropDuplicates().collect()]
 
     gk_list: List[DataFrame] = []
@@ -878,13 +704,10 @@ def main_processing_spark(data_path: str) -> None:
     mf_list: List[DataFrame] = []
     fw_list: List[DataFrame] = []
 
-    # Normaliza nombres de columnas esperados en GROUPS (porque tus GROUPS usan CamelCase)
-    # -> convertimos a lower en df_to_process para que coincida con compute_position_groups_spark
-    # Si tus columnas están en CamelCase en los CSV, elimina el normalize_columns o adapta esto.
+    # Para cada temporada computamos los porcentiles
     for sel_season in seasons:
         df_to_process = player_summ_no_team_all.filter(F.col("season") == sel_season)
 
-        # compute_position_groups_spark asume columna "position" y "player_slug" y métricas con el nombre exacto
         gk_pct = compute_position_groups_spark(df_to_process, "G", GK_GROUPS).withColumn("season", F.lit(sel_season))
         df_pct = compute_position_groups_spark(df_to_process, "D", DF_GROUPS).withColumn("season", F.lit(sel_season))
         mf_pct = compute_position_groups_spark(df_to_process, "M", MF_GROUPS).withColumn("season", F.lit(sel_season))
@@ -895,6 +718,7 @@ def main_processing_spark(data_path: str) -> None:
         mf_list.append(mf_pct)
         fw_list.append(fw_pct)
 
+    # Unión
     goalkeeper_percentiles_df = union_all(gk_list).dropDuplicates().orderBy("season", "player_slug")
     defender_percentiles_df   = union_all(df_list).dropDuplicates().orderBy("season", "player_slug")
     midfielder_percentiles_df = union_all(mf_list).dropDuplicates().orderBy("season", "player_slug")
@@ -906,7 +730,7 @@ def main_processing_spark(data_path: str) -> None:
     midfielder_percentiles_df = midfielder_percentiles_df.join(player_name_df, on="player_slug", how="left").withColumnRenamed("name", "player_name")
     forward_percentiles_df    = forward_percentiles_df.join(player_name_df, on="player_slug", how="left").withColumnRenamed("name", "player_name")
 
-    # Guardados percentiles (sin winutils)
+    # Guardados percentiles igual que antes
     write_csv_partitioned_no_hadoop(goalkeeper_percentiles_df, f"{tmp_dir}/GoalkeeperPercentile", sep=SEP, encoding=ENCODING, max_parts=16)
     merge_parts_to_single(f"{tmp_dir}/GoalkeeperPercentile", f"{data_path}/clean/GoalkeeperPercentile.csv", encoding=ENCODING)
 
@@ -919,9 +743,8 @@ def main_processing_spark(data_path: str) -> None:
     write_csv_partitioned_no_hadoop(forward_percentiles_df, f"{tmp_dir}/ForwardPercentile", sep=SEP, encoding=ENCODING, max_parts=16)
     merge_parts_to_single(f"{tmp_dir}/ForwardPercentile", f"{data_path}/clean/ForwardPercentile.csv", encoding=ENCODING)
 
-    print("Percentiles OK")
+    # PAramos la función
     spark.stop()
 
-
-if __name__ == "__main__":
-    main_processing_spark(data_path="G:\\FootballData\\data")
+# if __name__ == "__main__":
+#     main_processing_spark(data_path="G:\\FootballData\\data")

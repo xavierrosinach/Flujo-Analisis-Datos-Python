@@ -295,7 +295,15 @@ def full_league_season_scraper(driver, league_info_path: str, match_info_path: s
 # ===========================================================================================================================================
 # FUNCIÓN PRINCIPAL. A PARTIR DEL DRIVER OBTENEMOS TODA LA INFORMACIÓN DE TODAS LAS TEMPORADAS QUE TENEMOS
 # ===========================================================================================================================================
-def main_scraping(driver, data_path: str):
+def main_scraping(data_path: str):
+
+    # Creación de un driver general para todo el código
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+
+    # Servicio con chrome driver
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
 
     # Creamos los paths de los CSVs con información
     league_info_path = f'{data_path}/raw/LeagueInfo.csv'
@@ -338,22 +346,8 @@ def main_scraping(driver, data_path: str):
         league_info_df.loc[mask, 'ProcessedMatches'] = len(match_info_df[(match_info_df['league'] == league_to_proc) & (match_info_df['season'] == season_to_proc)])
         league_info_df.loc[mask, 'TotalMatches'] = total_league_matches
         league_info_df.to_csv(league_info_path, sep=';', index=False)
+    
+    driver.quit()           # Cerrar el driver
 
-# ===========================================================================================================================================
-# CREACIÓN DEL DRIVER Y EJECUCIÓN DEL CÓDIGO
-# ===========================================================================================================================================
-if __name__ == "__main__":
-
-    # Creación de un driver general para todo el código
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-
-    # Servicio con chrome driver
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-
-    # Ejecución del código de scraping
-    try:
-        main_scraping(driver=driver, data_path="G:\\FootballData\\data")
-    finally:
-        driver.quit()           # Cerrar el driver
+# if __name__ == "__main__":
+#     main_scraping(driver=driver, data_path="G:\\FootballData\\data")
