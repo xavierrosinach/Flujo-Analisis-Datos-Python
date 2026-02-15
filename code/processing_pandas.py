@@ -760,7 +760,7 @@ def main_processing_pandas(data_path):
 
         # Elegimos del dataframe la temporada
         df_to_process = player_summ_no_team_all[player_summ_no_team_all['season'] == sel_season].copy()
-        player_league_dict = (player_info_df_cleaned.set_index("player_slug")["league"].to_dict())
+        player_league_dict = (df_to_process.set_index("player_slug")["league"].to_dict())
 
         # Procesamos según posición
         gk_percentiles = compute_position_groups(df_to_process, "G", GK_GROUPS)
